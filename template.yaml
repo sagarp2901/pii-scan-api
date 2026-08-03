@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless sensitive-data (PII/PCI) scanning API.
+  Single-entry + batch endpoints, S3-managed encryption at rest, TLS-only in transit,
+  metered usage per API key.
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        USAGE_TABLE: !Ref UsageTable
+        JOBS_TABLE: !Ref JobsTable
+        UPLOAD_BUCKET: !Ref DataBucket
+        RESULTS_BUCKET: !Ref DataBucket
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploadsAndResults
+            Status: Enabled
+            ExpirationInDays: 3
+      VersioningConfiguration:
+        Status: Enabled
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub arn:aws:s3:::${DataBucket}
+              - !Sub arn:aws:s3:::${DataBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  UsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: api_key
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: api_key
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+
+  # ---------------------------------------------------------------------
+  # Queue for batch processing (+ DLQ for failed jobs)
+  # ---------------------------------------------------------------------
+  BatchDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  BatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 330
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BatchDLQ.Arn
+        maxReceiveCount: 3
+
+  # ---------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------
+  ScanApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST"]
+        AllowHeaders: ["authorization", "content-type"]
+
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: scan.app.handler
+      Runtime: python3.12
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsageTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ScanApi
+            Path: /scan
+            Method: POST
+
+  BatchSubmitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: batch_submit.app.handler
+      Runtime: python3.12
+      Environment:
+        Variables:
+          BATCH_QUEUE_URL: !Ref BatchQueue
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt BatchQueue.QueueName
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ScanApi
+            Path: /scan/batch
+            Method: POST
+
+  BatchWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: batch_worker.app.handler
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsageTable
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+      Events:
+        BatchTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BatchQueue.Arn
+            BatchSize: 1
+
+  BatchStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: batch_status.app.handler
+      Runtime: python3.12
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref JobsTable
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ScanApi
+            Path: /scan/batch/{job_id}
+            Method: GET
+
+  # ---------------------------------------------------------------------
+  # Model-backed scan (TinyLlama) - separate container-image function.
+  # Kept independent of the regex-only functions above: different package
+  # type (Image vs Zip), much higher memory/timeout needs, and a materially
+  # different cost profile. Opt-in via /scan/model, doesn't affect the
+  # existing /scan endpoint's cost or cold-start behavior at all.
+  #
+  # IMPORTANT: API Gateway HTTP APIs have a hard 30-second integration
+  # timeout that cannot be raised. A cold-start invocation (loading a
+  # ~1.1B-param model into memory before the first inference) may exceed
+  # that on first call after idle. Options if you hit this in practice:
+  #   - Enable Provisioned Concurrency on this function to keep it warm
+  #     (adds a flat hourly cost - not pay-per-use anymore for that slice)
+  #   - Call the Lambda directly via the SDK (bypassing API Gateway) for
+  #     batch/background use cases where a 502/504 on cold start is fine
+  #     to retry
+  #   - Front it with a Lambda Function URL in RESPONSE_STREAM mode
+  #     instead of API Gateway, which supports longer-running invocations
+  # ---------------------------------------------------------------------
+  ScanModelFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      MemorySize: 8192
+      Timeout: 30
+      Environment:
+        Variables:
+          USAGE_TABLE: !Ref UsageTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsageTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ScanApi
+            Path: /scan/model
+            Method: POST
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: .
+      DockerTag: latest
+
+  UsageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: usage.app.handler
+      Runtime: python3.12
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsageTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ScanApi
+            Path: /usage
+            Method: GET
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the API
+    Value: !Sub https://${ScanApi}.execute-api.${AWS::Region}.amazonaws.com/v1
+  DataBucketName:
+    Value: !Ref DataBucket
+  BatchQueueUrl:
+    Value: !Ref BatchQueue
