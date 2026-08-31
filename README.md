@@ -1,6 +1,6 @@
-# pii-scan-api
+# clarity-guard
 
-[![tests](https://github.com/sagarp2901/pii-scan-api/actions/workflows/test.yml/badge.svg)](https://github.com/sagarp2901/pii-scan-api/actions/workflows/test.yml)
+[![tests](https://github.com/sagarp2901/clarity-guard/actions/workflows/test.yml/badge.svg)](https://github.com/sagarp2901/clarity-guard/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Purpose
@@ -10,7 +10,7 @@ breach, an audit finding, or a compliance violation — because detecting PII/PC
 buried in logs, API payloads, data pipelines, and internal tools is normally
 either a manual review process or a large, expensive DLP platform integration.
 
-**pii-scan-api exists to make sensitive-data detection a five-minute add,
+**clarity-guard exists to make sensitive-data detection a five-minute add,
 not a quarter-long project.** The goal is for any engineering team to be
 able to drop a scan call into an existing API, ETL job, or internal
 workflow and get back structured findings they can act on immediately —
@@ -94,8 +94,8 @@ via the `ExpirationInDays` rule in `template.yaml`), then auto-delete.
 ## Deploy
 
 ```bash
-git clone https://github.com/sagarp2901/pii-scan-api.git
-cd pii-scan-api
+git clone https://github.com/sagarp2901/clarity-guard.git
+cd clarity-guard
 sam build
 sam deploy --guided
 ```
@@ -216,7 +216,7 @@ git init
 git add .
 git commit -m "Initial commit"
 git branch -M main
-git remote add origin https://github.com/sagarp2901/pii-scan-api.git
+git remote add origin https://github.com/sagarp2901/clarity-guard.git
 git push -u origin main
 ```
 
